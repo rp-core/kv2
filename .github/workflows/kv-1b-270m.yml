@@ -421,9 +421,9 @@ jobs:
           story_id         = "${STORY_ID}"
           model_id         = "${MODEL_ID}"
           out_bin          = "${BASE_BIN}"
-          worker_url       = "${{ secrets.WORKER_URL }}".rstrip("/")
-          admin_kv_secret  = "${{ secrets.INTERNAL_SECRET }}"
           account_id       = "${{ vars.CF_ACCOUNT_ID }}"
+          d1_db_id         = "${{ vars.CF_D1_DB_ID }}"
+          api_token        = "${{ secrets.CF_API_TOKEN }}"
           r2_access_key    = "${{ secrets.R2_ACCESS_KEY_ID }}"
           r2_secret_key    = "${{ secrets.R2_SECRET_ACCESS_KEY }}"
           r2_bucket        = "${{ secrets.R2_BUCKET_NAME }}"
@@ -488,29 +488,37 @@ jobs:
               print(f"❌ R2 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr)
               sys.exit(1)
 
-          register_payload = json.dumps({
-              "r2Key": r2_key,
-              "sha256": sha256,
-              "sizeBytes": len(raw),
-              "ggufFilename": gguf_filename,
-              "modelId": model_id,
-              "llamaRnVersion": "${{ env.KV_VERSION }}",
-          }).encode()
+          def d1_query(sql, params):
+              payload = json.dumps({"sql": sql, "params": params}).encode()
+              req = urllib.request.Request(
+                  f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{d1_db_id}/query",
+                  data=payload,
+                  headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req) as res:
+                  return json.loads(res.read())
 
-          register_req = urllib.request.Request(
-              f"{worker_url}/admin/stories/{story_id}/kv-bin",
-              data=register_payload,
-              headers={
-                  "Authorization": f"Bearer {admin_kv_secret}",
-                  "Content-Type": "application/json",
-              },
-              method="POST",
-          )
           try:
-              with urllib.request.urlopen(register_req) as res:
-                  body = json.loads(res.read())
-                  if not body.get("success"):
-                      print(f"❌ story base register 실패: {body}", file=sys.stderr)
+              d1_query(
+                  "DELETE FROM story_kv_cache WHERE story_id=? AND chapter_id='__base__' AND model_id=?",
+                  [story_id, model_id],
+              )
+              body = d1_query(
+                  "INSERT INTO story_kv_cache (story_id, chapter_id, model_id, llama_rn_version, r2_key) VALUES (?, '__base__', ?, ?, ?)",
+                  [story_id, model_id, "${{ env.KV_VERSION }}", r2_key],
+              )
+              if not body.get("success"):
+                  print(f"❌ story base register 실패: {body}", file=sys.stderr)
+                  sys.exit(1)
+
+              if model_id == "gemma-3-1b-qat":
+                  meta = d1_query(
+                      "UPDATE story_meta SET gguf_filename=COALESCE(?,gguf_filename), kv_bin_r2_key=?, kv_bin_hash=?, kv_bin_size=?, kv_baked_at=datetime('now'), kv_upload_status='done' WHERE id=?",
+                      [gguf_filename, r2_key, sha256, len(raw), story_id],
+                  )
+                  if not meta.get("success"):
+                      print(f"❌ story_meta 갱신 실패: {meta}", file=sys.stderr)
                       sys.exit(1)
           except urllib.error.HTTPError as e:
               print(f"❌ story base register 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr)
