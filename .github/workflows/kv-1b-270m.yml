@@ -194,7 +194,7 @@ jobs:
         id: chapters
         run: |
           STORY_ID="${{ github.event.inputs.story_id }}"
-          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?secret=${{ secrets.ADMIN_KV_SECRET }}")
+          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?secret=${{ secrets.INTERNAL_SECRET }}")
           if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
             echo "❌ 스토리 없음 또는 인증 실패: $STORY_ID"; exit 1
           fi
@@ -208,7 +208,7 @@ jobs:
         id: cores
         run: |
           STORY_ID="${{ github.event.inputs.story_id }}"
-          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-cores?secret=${{ secrets.ADMIN_KV_SECRET }}")
+          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-cores?secret=${{ secrets.INTERNAL_SECRET }}")
           if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
             echo "cores=[]" >> $GITHUB_OUTPUT
             echo "total_cores=0" >> $GITHUB_OUTPUT
@@ -237,14 +237,14 @@ jobs:
           PENDING_CHAPTERS=""
           for CH_ID in $(echo "$CHAPTERS" | jq -r '.[]'); do
             EXISTING=$(curl -sf \
-              "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv/$CH_ID?modelId=$MODEL_ID&secret=${{ secrets.ADMIN_KV_SECRET }}" \
+              "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv/$CH_ID?modelId=$MODEL_ID&secret=${{ secrets.INTERNAL_SECRET }}" \
               | jq -r '.exists // false')
             if [ "$EXISTING" = "true" ]; then
               echo "⏭  $CH_ID — 이미 존재, 스킵"
               continue
             fi
             PROMPT_JSON=$(curl -sf \
-              "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?chapterId=$CH_ID&secret=${{ secrets.ADMIN_KV_SECRET }}")
+              "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?chapterId=$CH_ID&secret=${{ secrets.INTERNAL_SECRET }}")
             PROMPT=$(echo "$PROMPT_JSON" | jq -r '.prompt')
             TOKEN_EST=$(echo "$PROMPT_JSON" | jq -r '.tokenEstimate // 0')
             PROMPT_FILE="/tmp/prompt_${CH_ID}_${MODEL_ID}.txt"
@@ -382,7 +382,7 @@ jobs:
           KV_PREFILL="llama_build/bin/kv-prefill"
 
           BASE_JSON=$(curl -sf \
-            "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-base-prompt?secret=${{ secrets.ADMIN_KV_SECRET }}")
+            "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-base-prompt?secret=${{ secrets.INTERNAL_SECRET }}")
           if [ $? -ne 0 ] || [ -z "$BASE_JSON" ]; then
             echo "❌ 스토리 base prompt 조회 실패"
             exit 1
@@ -422,7 +422,7 @@ jobs:
           model_id         = "${MODEL_ID}"
           out_bin          = "${BASE_BIN}"
           worker_url       = "${{ secrets.WORKER_URL }}".rstrip("/")
-          admin_kv_secret  = "${{ secrets.ADMIN_KV_SECRET }}"
+          admin_kv_secret  = "${{ secrets.INTERNAL_SECRET }}"
           account_id       = "${{ vars.CF_ACCOUNT_ID }}"
           r2_access_key    = "${{ secrets.R2_ACCESS_KEY_ID }}"
           r2_secret_key    = "${{ secrets.R2_SECRET_ACCESS_KEY }}"
