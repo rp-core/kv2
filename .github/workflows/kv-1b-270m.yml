@@ -12,6 +12,7 @@ env:
   CACHE_TYPE_V: q4_0
   KV_VERSION: "7"
   N_KEEP: 512
+  # Node.js 20 경고를 제거하기 위해 추가
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -31,4 +32,347 @@ jobs:
             rope_freq_base: 10000
 
           - model_id: gemma-3-270m
-            hf_repo: bartowski/google_gemma-3-270m-it-qat-G
+            hf_repo: bartowski/google_gemma-3-270m-it-qat-GGUF
+            hf_file: google_gemma-3-270m-it-qat-Q8_0.gguf
+            n_ctx: 4096
+            rope_freq_base: 10000
+
+    steps:
+      - name: 트리거 권한 확인
+        run: |
+          if [ "${{ github.actor }}" != "melona577" ]; then
+            echo "❌ 권한 없음: ${{ github.actor }}"
+            exit 1
+          fi
+          echo "✅ 인증됨: ${{ github.actor }}"
+      - name: kv-prefill 캐시 확인
+        id: cache-prefill
+        uses: actions/cache@v4
+        with:
+          path: llama_build/bin/kv-prefill
+          key: kv-prefill-${{ secrets.LLAMA_CPP_HASH }}-ubuntu-static
+
+      - name: llama.cpp 클론 및 kv-prefill 빌드
+        if: steps.cache-prefill.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/ggml-org/llama.cpp llama_src
+          cd llama_src
+          git checkout ${{ secrets.LLAMA_CPP_HASH }}
+          git log --oneline -1
+          mkdir -p examples/kv-prefill
+          cat << 'EOF' > examples/kv-prefill/kv-prefill.cpp
+          #include "llama.h"
+          #include <cstdio>
+          #include <cstring>
+          #include <fstream>
+          #include <sstream>
+          #include <string>
+          #include <vector>
+          int main(int argc, char** argv) {
+            if (argc < 8) {
+              fprintf(stderr,
+                "Usage: kv-prefill <model> <n_ctx> <rope_freq_base>"
+                " <cache_type_k> <cache_type_v> <n_keep>"
+                " <prompt_file:output_bin> [...]\n");
+              return 1;
+            }
+            const char* model_path     = argv[1];
+            int         n_ctx          = atoi(argv[2]);
+            float       rope_freq_base = atof(argv[3]);
+            const char* ck             = argv[4];
+            const char* cv             = argv[5];
+            int         n_keep         = atoi(argv[6]);
+            auto parse_type = [](const char* s) -> ggml_type {
+              if (strcmp(s, "q8_0") == 0) return GGML_TYPE_Q8_0;
+              if (strcmp(s, "q4_0") == 0) return GGML_TYPE_Q4_0;
+              if (strcmp(s, "f16")  == 0) return GGML_TYPE_F16;
+              return GGML_TYPE_F16;
+            };
+            llama_backend_init();
+            llama_model_params mparams = llama_model_default_params();
+            mparams.use_mmap = true;
+            llama_model* model = llama_model_load_from_file(model_path, mparams);
+            if (!model) { fprintf(stderr, "❌ 모델 로드 실패: %s\n", model_path); llama_backend_free(); return 1; }
+            fprintf(stderr, "✅ 모델 로드 완료\n");
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_ctx           = n_ctx;
+            cparams.n_batch         = n_ctx;
+            cparams.n_ubatch        = n_ctx;
+            cparams.rope_freq_base  = rope_freq_base;
+            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            cparams.type_k          = parse_type(ck);
+            cparams.type_v          = parse_type(cv);
+            const llama_vocab* vocab = llama_model_get_vocab(model);
+            int total = argc - 7;
+            int ok = 0, fail = 0;
+            for (int i = 7; i < argc; i++) {
+              std::string arg(argv[i]);
+              auto sep = arg.rfind(':');
+              if (sep == std::string::npos) {
+                fprintf(stderr, "❌ 잘못된 인자 (prompt:output 형식 필요): %s\n", argv[i]);
+                fail++; continue;
+              }
+              std::string prompt_file = arg.substr(0, sep);
+              std::string output_bin  = arg.substr(sep + 1);
+              fprintf(stderr, "\n[%d/%d] %s\n", i-6, total, prompt_file.c_str());
+              std::ifstream pf(prompt_file);
+              if (!pf.is_open()) { fprintf(stderr, "❌ 프롬프트 파일 열기 실패\n"); fail++; continue; }
+              std::ostringstream ss; ss << pf.rdbuf();
+              std::string prompt = ss.str();
+              llama_context* ctx = llama_init_from_model(model, cparams);
+              if (!ctx) { fprintf(stderr, "❌ 컨텍스트 초기화 실패\n"); fail++; continue; }
+              std::vector<llama_token> tokens(n_ctx);
+              int n_tokens = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(),
+                                            tokens.data(), (int)tokens.size(), true, true);
+              if (n_tokens < 0) {
+                fprintf(stderr, "❌ 토크나이즈 실패\n");
+                llama_free(ctx); fail++; continue;
+              }
+              tokens.resize(n_tokens);
+              fprintf(stderr, "  토큰: %d\n", n_tokens);
+              llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
+              if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "❌ prefill 실패\n");
+                llama_free(ctx); fail++; continue;
+              }
+              if (!llama_state_save_file(ctx, output_bin.c_str(), tokens.data(), n_tokens)) {
+                fprintf(stderr, "❌ KV 저장 실패: %s\n", output_bin.c_str());
+                llama_free(ctx); fail++; continue;
+              }
+              fprintf(stderr, "  ✅ 저장 완료: %s\n", output_bin.c_str());
+              llama_free(ctx);
+              ok++;
+            }
+            llama_model_free(model);
+            llama_backend_free();
+            fprintf(stderr, "\n완료: 성공 %d / 실패 %d\n", ok, fail);
+            return fail > 0 ? 1 : 0;
+          }
+          EOF
+          cat << 'EOF' > examples/kv-prefill/CMakeLists.txt
+          add_executable(kv-prefill kv-prefill.cpp)
+          target_link_libraries(kv-prefill PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+          target_include_directories(kv-prefill PRIVATE
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/ggml/include
+            ${CMAKE_SOURCE_DIR}/src
+          )
+          install(TARGETS kv-prefill RUNTIME)
+          EOF
+          echo 'add_subdirectory(examples/kv-prefill)' >> CMakeLists.txt
+          cmake -B build \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DGGML_NATIVE=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build -j$(nproc) --target kv-prefill
+          mkdir -p ../llama_build/bin
+          cp build/bin/kv-prefill ../llama_build/bin/
+          echo "✅ kv-prefill 빌드 완료"
+      - name: kv-prefill 권한 설정
+        run: chmod +x llama_build/bin/kv-prefill
+
+      - name: 모델 캐시 확인
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/${{ matrix.hf_file }}
+          key: model-${{ matrix.hf_file }}
+
+      - name: 모델 다운로드
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          curl -L \
+            -H "User-Agent: RPcore-App/3.0" \
+            "https://huggingface.co/${{ matrix.hf_repo }}/resolve/main/${{ matrix.hf_file }}" \
+            -o "models/${{ matrix.hf_file }}"
+          echo "✅ 모델 다운로드 완료: ${{ matrix.model_id }}"
+      # ── 3. 챕터 목록 조회 ────────────────────────────────────
+      - name: 챕터 목록 가져오기
+        id: chapters
+        run: |
+          STORY_ID="${{ github.event.inputs.story_id }}"
+          # [수정] ?secret 파라미터 추가
+          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?secret=${{ secrets.ADMIN_KV_SECRET }}")
+          if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
+            echo "❌ 스토리 없음 또는 인증 실패: $STORY_ID"; exit 1
+          fi
+          CHAPTERS=$(echo "$RESPONSE" | jq -r '[.chapters[].chapterId] | @json')
+          TOTAL=$(echo "$RESPONSE" | jq '.chapters | length')
+          echo "chapters=$CHAPTERS" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "✅ 챕터 ${TOTAL}개 발견 (모델: ${{ matrix.model_id }})"
+      # ── 4. 코어 목록 조회 ────────────────────────────────────
+      - name: 코어 목록 가져오기
+        id: cores
+        run: |
+          STORY_ID="${{ github.event.inputs.story_id }}"
+          # [수정] ?secret 파라미터 추가
+          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-cores?secret=${{ secrets.ADMIN_KV_SECRET }}")
+          if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
+            echo "cores=[]" >> $GITHUB_OUTPUT
+            echo "total_cores=0" >> $GITHUB_OUTPUT
+            echo "⚠️  코어 없음 (스킵)"
+          else
+            CORES=$(echo "$RESPONSE" | jq -r '[.cores[].index] | @json')
+            TOTAL=$(echo "$RESPONSE" | jq '.cores | length')
+            echo "cores=$CORES" >> $GITHUB_OUTPUT
+            echo "total_cores=$TOTAL" >> $GITHUB_OUTPUT
+            echo "✅ 코어 ${TOTAL}개 발견"
+          fi
+      # ── 5. 챕터별 KV 생성 및 업로드 ──────────────────────────
+      - name: 챕터 KV 생성 및 업로드
+        run: |
+          STORY_ID="${{ github.event.inputs.story_id }}"
+          MODEL_ID="${{ matrix.model_id }}"
+          MODEL_FILE="models/${{ matrix.hf_file }}"
+          N_CTX="${{ matrix.n_ctx }}"
+          ROPE="${{ matrix.rope_freq_base }}"
+          CHAPTERS='${{ steps.chapters.outputs.chapters }}'
+          KV_PREFILL="llama_build/bin/kv-prefill"
+          echo "════════════════════════════════════"
+          echo "스토리: $STORY_ID | 모델: $MODEL_ID"
+          echo "════════════════════════════════════"
+          PREFILL_ARGS=""
+          PENDING_CHAPTERS=""
+          for CH_ID in $(echo "$CHAPTERS" | jq -r '.[]'); do
+            # [수정] ?secret 파라미터 추가
+            EXISTING=$(curl -sf \
+              "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv/$CH_ID?modelId=$MODEL_ID&secret=${{ secrets.ADMIN_KV_SECRET }}" \
+              | jq -r '.exists // false')
+            if [ "$EXISTING" = "true" ]; then
+              echo "⏭  $CH_ID — 이미 존재, 스킵"
+              continue
+            fi
+            # [수정] &secret 파라미터 추가
+            PROMPT_JSON=$(curl -sf \
+              "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?chapterId=$CH_ID&secret=${{ secrets.ADMIN_KV_SECRET }}")
+            PROMPT=$(echo "$PROMPT_JSON" | jq -r '.prompt')
+            TOKEN_EST=$(echo "$PROMPT_JSON" | jq -r '.tokenEstimate // 0')
+            PROMPT_FILE="/tmp/prompt_${CH_ID}_${MODEL_ID}.txt"
+            OUT_BIN="/tmp/kv_${STORY_ID}_${CH_ID}_${MODEL_ID}.bin"
+            echo "$PROMPT" > "$PROMPT_FILE"
+            echo "  📥 $CH_ID (~${TOKEN_EST} 토큰)"
+            PREFILL_ARGS="$PREFILL_ARGS ${PROMPT_FILE}:${OUT_BIN}"
+            PENDING_CHAPTERS="$PENDING_CHAPTERS $CH_ID"
+          done
+          if [ -z "$PENDING_CHAPTERS" ]; then
+            echo "✅ 모든 챕터 이미 존재 — 완료"
+            exit 0
+          fi
+          echo ""
+          echo "🚀 kv-prefill 실행 (모델 1회 로드, 챕터 일괄 처리)..."
+          "$KV_PREFILL" \
+            "$MODEL_FILE" \
+            "$N_CTX" \
+            "$ROPE" \
+            "${{ env.CACHE_TYPE_K }}" \
+            "${{ env.CACHE_TYPE_V }}" \
+            "${{ env.N_KEEP }}" \
+            $PREFILL_ARGS
+          SUCCESS=0
+          FAIL=0
+          for CH_ID in $PENDING_CHAPTERS; do
+            OUT_BIN="/tmp/kv_${STORY_ID}_${CH_ID}_${MODEL_ID}.bin"
+            PROMPT_FILE="/tmp/prompt_${CH_ID}_${MODEL_ID}.txt"
+            if [ ! -f "$OUT_BIN" ] || [ ! -s "$OUT_BIN" ]; then
+              echo "❌ $CH_ID — KV bin 없음 (prefill 실패)"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
+            BIN_KB=$(( $(wc -c < "$OUT_BIN") / 1024 ))
+            echo "📤 $CH_ID — ${BIN_KB} KB 업로드 중..."
+            python3 << PYEOF
+          import sys, json, hashlib, hmac, datetime
+          import urllib.request, urllib.error
+          from urllib.parse import urlencode
+          story_id      = "${STORY_ID}"
+          ch_id         = "${CH_ID}"
+          model_id      = "${MODEL_ID}"
+          out_bin       = "${OUT_BIN}"
+          account_id    = "${{ vars.CF_ACCOUNT_ID }}"
+          d1_db_id      = "${{ vars.CF_D1_DB_ID }}"
+          api_token     = "${{ secrets.CF_API_TOKEN }}"
+          r2_access_key = "${{ secrets.R2_ACCESS_KEY_ID }}"
+          r2_secret_key = "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+          r2_bucket     = "${{ secrets.R2_BUCKET_NAME }}"
+          kv_version    = "${{ env.KV_VERSION }}"
+          with open(out_bin, "rb") as f:
+              raw = f.read()
+          r2_key = f"kv_cache/{story_id}/{ch_id}_{model_id}.bin"
+          def sha256hex(data):
+              if isinstance(data, str): data = data.encode()
+              return hashlib.sha256(data).hexdigest()
+          def hmac_sha256(key, msg):
+              if isinstance(msg, str): msg = msg.encode()
+              return hmac.new(key if isinstance(key, bytes) else key.encode(), msg, hashlib.sha256).digest()
+          def get_signing_key(secret, datestamp, region, service):
+              k = hmac_sha256(f"AWS4{secret}", datestamp)
+              k = hmac_sha256(k, region)
+              k = hmac_sha256(k, service)
+              return hmac_sha256(k, "aws4_request")
+          now = datetime.datetime.now(datetime.timezone.utc)
+          datestamp = now.strftime("%Y%m%d")
+          timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+          region, service = "auto", "s3"
+          host = f"{r2_bucket}.{account_id}.r2.cloudflarestorage.com"
+          credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+          params = sorted([
+              ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+              ("X-Amz-Credential", f"{r2_access_key}/{credential_scope}"),
+              ("X-Amz-Date", timestamp),
+              ("X-Amz-Expires", "3600"),
+              ("X-Amz-SignedHeaders", "host"),
+          ])
+          qs = urlencode(params)
+          canonical = "\n".join(["PUT", f"/{r2_key}", qs, f"host:{host}\n", "host", "UNSIGNED-PAYLOAD"])
+          string_to_sign = "\n".join(["AWS4-HMAC-SHA256", timestamp, credential_scope, sha256hex(canonical)])
+          signing_key = get_signing_key(r2_secret_key, datestamp, region, service)
+          signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+          presigned_url = f"https://{host}/{r2_key}?{qs}&X-Amz-Signature={signature}"
+          req = urllib.request.Request(presigned_url, data=raw,
+              headers={"Content-Type": "application/octet-stream"}, method="PUT")
+          try:
+              with urllib.request.urlopen(req) as res:
+                  if res.status not in (200, 204):
+                      print(f"❌ R2 실패: {res.status}", file=sys.stderr); sys.exit(1)
+          except urllib.error.HTTPError as e:
+              print(f"❌ R2 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
+          def d1_query(sql, params):
+              payload = json.dumps({"sql": sql, "params": params}).encode()
+              req = urllib.request.Request(
+                  f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{d1_db_id}/query",
+                  data=payload,
+                  headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req) as res:
+                  return json.loads(res.read())
+          try:
+              d1_query("DELETE FROM story_kv_cache WHERE story_id=? AND chapter_id=? AND model_id=?",
+                       [story_id, ch_id, model_id])
+              body = d1_query(
+                  "INSERT INTO story_kv_cache (story_id, chapter_id, model_id, llama_rn_version, r2_key) VALUES (?, ?, ?, ?, ?)",
+                  [story_id, ch_id, model_id, kv_version, r2_key]
+              )
+              if body.get("success"):
+                  print(f"✅ {r2_key}")
+              else:
+                  print(f"❌ D1 실패: {body}", file=sys.stderr); sys.exit(1)
+          except urllib.error.HTTPError as e:
+              print(f"❌ D1 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
+          PYEOF
+            if [ $? -ne 0 ]; then FAIL=$((FAIL + 1)); else SUCCESS=$((SUCCESS + 1)); fi
+            rm -f "$OUT_BIN" "$PROMPT_FILE"
+          done
+          echo ""
+          echo "════════════════════════════════════"
+          echo "[$MODEL_ID] 완료: 성공 ${SUCCESS}개 / 실패 ${FAIL}개"
+          echo "════════════════════════════════════"
+          if [ "$FAIL" -gt 0 ]; then exit 1; fi
+          curl -sf -X POST \
+            "${{ secrets.WORKER_URL }}/internal/stories/$STORY_ID/kv-done" \
+            -H "X-Internal-Secret: ${{ secrets.INTERNAL_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{}' || echo "⚠️  kv-done 신고 실패 (무시)"
