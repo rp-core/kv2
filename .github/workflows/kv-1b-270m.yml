@@ -102,6 +102,7 @@ jobs:
             cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
             cparams.type_k          = parse_type(ck);
             cparams.type_v          = parse_type(cv);
+            cparams.kv_unified      = true;
             const llama_vocab* vocab = llama_model_get_vocab(model);
             int total = argc - 7;
             int ok = 0, fail = 0;
