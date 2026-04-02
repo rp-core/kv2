@@ -8,7 +8,7 @@ on:
         required: true
 
 env:
-  CACHE_TYPE_K: q8_0
+  CACHE_TYPE_K: f16
   CACHE_TYPE_V: f16  
   KV_VERSION: "7"
   N_KEEP: 512
